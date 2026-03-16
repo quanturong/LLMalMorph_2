@@ -1,0 +1,382 @@
+"""
+Project Parser - Parse Multi-File Malware Projects
+==================================================
+Parses complete projects with multiple source and header files.
+
+Features:
+- Multi-file parsing
+- Cross-file function extraction
+- Global variable tracking
+- Header dependency resolution
+"""
+
+import os
+import sys
+from pathlib import Path
+from typing import List, Dict, Tuple, Set
+import logging
+
+# Import tree-sitter parser
+from tree_sitter_parser import (
+    initialize_parser,
+    read_source_code,
+    extract_functions_globals_headers,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class ProjectParseResult:
+    """Result of parsing a complete project"""
+    
+    def __init__(self, project_name: str):
+        self.project_name = project_name
+        
+        # Per-file results
+        self.file_results: Dict[str, Dict] = {}
+        
+        # Aggregated results
+        self.all_functions = []
+        self.all_globals = []
+        self.all_headers = []
+        self.all_classes = []
+        self.all_structs = []
+        
+        # Statistics
+        self.total_files = 0
+        self.parsed_files = 0
+        self.failed_files = 0
+        self.total_functions = 0
+        self.total_lines = 0
+        
+    def add_file_result(self, filepath: str, result: Dict):
+        """Add parsing result for a file"""
+        self.file_results[filepath] = result
+        self.total_files += 1
+        
+        if result.get('success'):
+            self.parsed_files += 1
+            
+            # Aggregate functions
+            functions = result.get('functions', [])
+            for func in functions:
+                # Add source file info to function
+                func['source_file'] = filepath
+                self.all_functions.append(func)
+            
+            # Aggregate globals
+            globals_vars = result.get('globals', [])
+            for g in globals_vars:
+                # Globals might be strings or dicts
+                if isinstance(g, str):
+                    self.all_globals.append({'name': g, 'source_file': filepath})
+                else:
+                    g['source_file'] = filepath
+                    self.all_globals.append(g)
+            
+            # Aggregate headers
+            headers = result.get('headers', [])
+            self.all_headers.extend(headers)
+            
+            # Aggregate classes
+            classes = result.get('classes', [])
+            for c in classes:
+                if isinstance(c, dict):
+                    c['source_file'] = filepath
+                    self.all_classes.append(c)
+                else:
+                    self.all_classes.append({'name': str(c), 'source_file': filepath})
+            
+            # Aggregate structs
+            structs = result.get('structs', [])
+            for s in structs:
+                if isinstance(s, dict):
+                    s['source_file'] = filepath
+                    self.all_structs.append(s)
+                else:
+                    self.all_structs.append({'name': str(s), 'source_file': filepath})
+            
+            self.total_lines += result.get('lines', 0)
+        else:
+            self.failed_files += 1
+    
+    def update_statistics(self):
+        """Update statistics"""
+        self.total_functions = len(self.all_functions)
+        self.all_headers = sorted(set(self.all_headers))
+    
+    def to_dict(self):
+        """Convert to dictionary"""
+        self.update_statistics()
+        
+        return {
+            'project_name': self.project_name,
+            'statistics': {
+                'total_files': self.total_files,
+                'parsed_files': self.parsed_files,
+                'failed_files': self.failed_files,
+                'total_functions': self.total_functions,
+                'total_lines': self.total_lines,
+                'total_globals': len(self.all_globals),
+                'total_headers': len(self.all_headers),
+                'total_classes': len(self.all_classes),
+                'total_structs': len(self.all_structs),
+            },
+            'functions': self.all_functions,
+            'globals': self.all_globals,
+            'headers': self.all_headers,
+            'classes': self.all_classes,
+            'structs': self.all_structs,
+            'file_results': self.file_results,
+        }
+    
+    def get_functions_by_file(self, filepath: str) -> List[Dict]:
+        """Get functions from specific file"""
+        return [f for f in self.all_functions if f['source_file'] == filepath]
+    
+    def get_function_by_name(self, func_name: str) -> Dict:
+        """Find function by name"""
+        for func in self.all_functions:
+            if func.get('name_only') == func_name or func.get('name_with_params') == func_name:
+                return func
+        return None
+    
+    def print_summary(self):
+        """Print parsing summary"""
+        self.update_statistics()
+        
+        print("\n" + "="*70)
+        print(f"📊 PROJECT PARSE SUMMARY: {self.project_name}")
+        print("="*70)
+        print(f"Files:")
+        print(f"  Total: {self.total_files}")
+        print(f"  Parsed: {self.parsed_files} ✓")
+        print(f"  Failed: {self.failed_files} ✗")
+        print(f"\nCode Elements:")
+        print(f"  Functions: {self.total_functions}")
+        print(f"  Global Variables: {len(self.all_globals)}")
+        print(f"  Classes: {len(self.all_classes)}")
+        print(f"  Structs: {len(self.all_structs)}")
+        print(f"  Unique Headers: {len(self.all_headers)}")
+        print(f"\nLines of Code:")
+        print(f"  Total: {self.total_lines:,}")
+        print("="*70)
+
+
+class ProjectParser:
+    """Parse complete C/C++ projects"""
+    
+    def __init__(self):
+        self.parse_results = {}
+        
+    def parse_project(self, project) -> ProjectParseResult:
+        """
+        Parse complete project
+        
+        Args:
+            project: MalwareProject object from project_detector
+            
+        Returns:
+            ProjectParseResult object
+        """
+        logger.info(f"\n{'='*60}")
+        logger.info(f"📖 PARSING PROJECT: {project.name}")
+        logger.info(f"{'='*60}")
+        logger.info(f"Source files: {len(project.source_files)}")
+        logger.info(f"Header files: {len(project.header_files)}")
+        
+        result = ProjectParseResult(project.name)
+        
+        # Parse all source files
+        for i, source_file in enumerate(project.source_files, 1):
+            logger.info(f"\n[{i}/{len(project.source_files)}] Parsing: {os.path.basename(source_file)}")
+            
+            file_result = self._parse_file(source_file)
+            result.add_file_result(source_file, file_result)
+            
+            if file_result.get('success'):
+                funcs = len(file_result.get('functions', []))
+                globs = len(file_result.get('globals', []))
+                logger.info(f"   ✓ Functions: {funcs}, Globals: {globs}")
+            else:
+                logger.warning(f"   ✗ Failed: {file_result.get('error', 'Unknown error')}")
+        
+        # Update statistics
+        result.update_statistics()
+        
+        # Store result
+        self.parse_results[project.name] = result
+        
+        # Print summary
+        result.print_summary()
+        
+        return result
+    
+    def _parse_file(self, filepath: str) -> Dict:
+        """
+        Parse a single source file
+        
+        Args:
+            filepath: Path to source file
+            
+        Returns:
+            Dictionary with parsing results
+        """
+        try:
+            # Read source code
+            source_code = read_source_code(filepath)
+            
+            # Initialize parser
+            parser = initialize_parser(filepath)
+            if not parser:
+                return {
+                    'success': False,
+                    'error': 'Could not initialize parser'
+                }
+            
+            # Parse
+            tree = parser.parse(bytes(source_code, "utf8"))
+            
+            # Extract functions, globals, headers
+            parsed_info = extract_functions_globals_headers(source_code, tree)
+            headers, globals_vars, functions, classes, structs = parsed_info
+            
+            return {
+                'success': True,
+                'filepath': filepath,
+                'headers': headers,
+                'globals': globals_vars,
+                'functions': functions,
+                'classes': classes,
+                'structs': structs,
+                'lines': len(source_code.split('\n')),
+                'size': len(source_code),
+            }
+            
+        except Exception as e:
+            logger.debug(f"Error parsing {filepath}: {e}")
+            return {
+                'success': False,
+                'filepath': filepath,
+                'error': str(e),
+            }
+    
+    def select_functions_for_mutation(
+        self,
+        parse_result: ProjectParseResult,
+        num_functions: int = 10,
+        selection_strategy: str = 'largest'
+    ) -> List[Dict]:
+        """
+        Select functions from project for mutation
+        
+        Args:
+            parse_result: ProjectParseResult object
+            num_functions: Number of functions to select
+            selection_strategy: 'largest', 'random', 'all'
+            
+        Returns:
+            List of selected function objects
+        """
+        all_functions = parse_result.all_functions
+        
+        if not all_functions:
+            logger.warning("No functions found in project")
+            return []
+        
+        logger.info(f"\n📋 Selecting {num_functions} functions for mutation...")
+        logger.info(f"   Strategy: {selection_strategy}")
+        logger.info(f"   Available: {len(all_functions)} functions")
+        
+        selected = []
+        
+        if selection_strategy == 'largest':
+            # Sort by function size (body length)
+            sorted_funcs = sorted(
+                all_functions,
+                key=lambda f: len(f.get('body', '')),
+                reverse=True
+            )
+            selected = sorted_funcs[:num_functions]
+            
+        elif selection_strategy == 'random':
+            import random
+            selected = random.sample(
+                all_functions,
+                min(num_functions, len(all_functions))
+            )
+            
+        elif selection_strategy == 'all':
+            selected = all_functions[:num_functions]
+        
+        else:
+            # Default: first N functions
+            selected = all_functions[:num_functions]
+        
+        logger.info(f"   ✓ Selected {len(selected)} functions")
+        
+        # Print selected functions
+        for i, func in enumerate(selected, 1):
+            source_file = os.path.basename(func.get('source_file', 'unknown'))
+            func_name = func.get('name_only', 'unknown')
+            func_size = len(func.get('body', ''))
+            logger.info(f"      {i}. {func_name} ({source_file}, {func_size} chars)")
+        
+        return selected
+    
+    def export_parse_result(self, parse_result: ProjectParseResult, output_file: str):
+        """Export parse result to JSON"""
+        import json
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(parse_result.to_dict(), f, indent=2)
+        
+        logger.info(f"\n✅ Exported parse result to: {output_file}")
+
+
+def main():
+    """Test project parsing"""
+    import sys
+    from project_detector import ProjectDetector
+    
+    if len(sys.argv) < 2:
+        print("Usage: python project_parser.py <base_directory>")
+        sys.exit(1)
+    
+    base_dir = sys.argv[1]
+    
+    # Setup logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(message)s'
+    )
+    
+    # Step 1: Detect projects
+    logger.info("Step 1: Detecting projects...")
+    detector = ProjectDetector(base_dir)
+    projects = detector.detect_projects()
+    
+    if not projects:
+        logger.error("No projects found!")
+        sys.exit(1)
+    
+    # Step 2: Parse first project
+    project = projects[0]
+    logger.info(f"\nStep 2: Parsing project: {project.name}")
+    
+    parser = ProjectParser()
+    result = parser.parse_project(project)
+    
+    # Step 3: Export results
+    output_file = f"parsed_{project.name}.json"
+    parser.export_parse_result(result, output_file)
+    
+    # Step 4: Select functions
+    selected = parser.select_functions_for_mutation(result, num_functions=5)
+    
+    logger.info(f"\n✅ Done!")
+
+
+if __name__ == "__main__":
+    main()
+
