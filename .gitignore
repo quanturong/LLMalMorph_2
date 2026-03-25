@@ -55,6 +55,7 @@ ENV/
 Thumbs.db
 
 # Output directories
+samples/
 output/
 example_output/
 selected_samples/*/llm_generated/
