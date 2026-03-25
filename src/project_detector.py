@@ -63,6 +63,13 @@ class MalwareProject:
         """Check if C++ project"""
         exts = self.get_source_extensions()
         return any(ext in exts for ext in ['.cpp', '.cxx', '.cc'])
+
+    def is_python_project(self) -> bool:
+        """Check if Python project"""
+        exts = self.get_source_extensions()
+        has_cpp = any(ext in exts for ext in ['.cpp', '.cxx', '.cc'])
+        has_c = '.c' in exts and not has_cpp
+        return '.py' in exts and not has_c and not has_cpp
     
     def get_language(self) -> str:
         """Get project language"""
@@ -70,6 +77,8 @@ class MalwareProject:
             return 'cpp'
         elif self.is_c_project():
             return 'c'
+        elif self.is_python_project():
+            return 'python'
         return 'unknown'
     
     def __repr__(self):
@@ -83,7 +92,7 @@ class ProjectDetector:
     """Detect and parse complete malware projects"""
     
     # Source file extensions
-    SOURCE_EXTS = {'.c', '.cpp', '.cxx', '.cc', '.C'}
+    SOURCE_EXTS = {'.c', '.cpp', '.cxx', '.cc', '.C', '.py'}
     HEADER_EXTS = {'.h', '.hpp', '.hxx', '.hh', '.H'}
     BUILD_EXTS = {'.vcproj', '.vcxproj', '.sln', '.dsp', '.dsw', 'Makefile', 'CMakeLists.txt'}
     

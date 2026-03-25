@@ -6,8 +6,8 @@
     "api_key": "",
     "deepseek_api_key": ""
   },
-    "project_detection": {
-      "base_directory": "E:\\MW\\LLMalMorph_2\\samples\\ZIB-Trojan",
+  "project_detection": {
+    "base_directory": "E:\\MW\\LLMalMorph_2\\samples\\ZIB-Trojan",
     "min_files_for_project": 1,
     "recursive_search": true,
     "filters": {
@@ -17,9 +17,9 @@
     }
   },
   "mutation": {
-    "num_functions_per_project": 10,
+    "num_functions_per_project": 0,
     "function_selection_strategy": "largest",
-      "strategy": "strat_all",
+    "strategy": "strat_all",
     "llm_model": "deepseek-chat",
     "trials": 1,
     "initial_seed": 42,
@@ -27,7 +27,11 @@
     "func_batch_size": 1,
     "source_code_response_format": "backticks",
     "retry_generation_attempts": 5,
-    "strat_all_order": ["strat_1", "strat_5", "strat_6"],
+    "strat_all_order": [
+      "strat_1",
+      "strat_5",
+      "strat_6"
+    ],
     "batch_mutations": false,
     "preserve_signatures": true,
     "preserve_entry_points": true,

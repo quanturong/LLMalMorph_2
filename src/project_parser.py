@@ -12,6 +12,8 @@ Features:
 
 import os
 import sys
+import ast
+import re
 from pathlib import Path
 from typing import List, Dict, Tuple, Set
 import logging
@@ -225,6 +227,10 @@ class ProjectParser:
         try:
             # Read source code
             source_code = read_source_code(filepath)
+
+            # Python fallback parser: AST-based extraction for .py files
+            if filepath.lower().endswith('.py'):
+                return self._parse_python_file(filepath, source_code)
             
             # Initialize parser
             parser = initialize_parser(filepath)
@@ -260,6 +266,172 @@ class ProjectParser:
                 'filepath': filepath,
                 'error': str(e),
             }
+
+    def _parse_python_file(self, filepath: str, source_code: str) -> Dict:
+        """Parse Python source using built-in AST and map to common function schema."""
+        try:
+            tree = ast.parse(source_code)
+        except SyntaxError as e:
+            # Python 2 syntax (e.g., print statement) fails in Python 3 AST.
+            # Fall back to a tolerant text parser so legacy files are still indexed.
+            return self._parse_python_legacy_fallback(filepath, source_code, str(e))
+
+        lines = source_code.split('\n')
+        functions = []
+        globals_vars = []
+        imports = []
+        classes = []
+        structs = []
+
+        def _end_lineno(node):
+            end = getattr(node, 'end_lineno', None)
+            if end is not None:
+                return end
+            return getattr(node, 'lineno', 1)
+
+        for node in tree.body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                imports.append(ast.get_source_segment(source_code, node) or '')
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        globals_vars.append({'name': target.id})
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                globals_vars.append({'name': node.target.id})
+            elif isinstance(node, ast.ClassDef):
+                classes.append({'name': node.name})
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                start_line = getattr(node, 'lineno', 1)
+                end_line = _end_lineno(node)
+                body_text = '\n'.join(lines[start_line - 1:end_line])
+
+                arg_names = []
+                for arg in getattr(node.args, 'posonlyargs', []):
+                    arg_names.append(arg.arg)
+                for arg in node.args.args:
+                    arg_names.append(arg.arg)
+                if node.args.vararg:
+                    arg_names.append('*' + node.args.vararg.arg)
+                for arg in node.args.kwonlyargs:
+                    arg_names.append(arg.arg)
+                if node.args.kwarg:
+                    arg_names.append('**' + node.args.kwarg.arg)
+
+                signature = f"{node.name}({', '.join(arg_names)})"
+
+                functions.append({
+                    'name_only': node.name,
+                    'name_with_params': signature,
+                    'body': body_text,
+                    'start_line': start_line,
+                    'end_line': end_line,
+                })
+
+        imports = [i for i in imports if i]
+
+        return {
+            'success': True,
+            'filepath': filepath,
+            'headers': imports,
+            'globals': globals_vars,
+            'functions': functions,
+            'classes': classes,
+            'structs': structs,
+            'lines': len(lines),
+            'size': len(source_code),
+        }
+
+    def _parse_python_legacy_fallback(self, filepath: str, source_code: str, parse_error: str) -> Dict:
+        """Best-effort parser for Python 2 / syntactically invalid Python files."""
+        lines = source_code.split('\n')
+        imports = []
+        globals_vars = []
+        classes = []
+        structs = []
+        functions = []
+
+        import_re = re.compile(r'^\s*(import\s+.+|from\s+.+\s+import\s+.+)\s*$')
+        class_re = re.compile(r'^\s*class\s+([A-Za-z_]\w*)\b')
+        def_re = re.compile(r'^\s*def\s+([A-Za-z_]\w*)\s*\((.*?)\)\s*:')
+        global_re = re.compile(r'^\s*([A-Za-z_]\w*)\s*=')
+
+        # Collect top-level imports, globals, classes, functions.
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped or stripped.startswith('#'):
+                continue
+
+            if import_re.match(line):
+                imports.append(stripped)
+                continue
+
+            if not line.startswith((' ', '\t')):
+                class_match = class_re.match(line)
+                if class_match:
+                    classes.append({'name': class_match.group(1)})
+                    continue
+
+                global_match = global_re.match(line)
+                if global_match and not stripped.startswith(('def ', 'class ', 'if ', 'for ', 'while ', 'try:', 'with ')):
+                    globals_vars.append({'name': global_match.group(1)})
+
+        # Extract top-level function blocks by indentation boundaries.
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if line.startswith((' ', '\t')):
+                i += 1
+                continue
+
+            def_match = def_re.match(line)
+            if not def_match:
+                i += 1
+                continue
+
+            func_name = def_match.group(1)
+            params = def_match.group(2).strip()
+            start_line = i + 1
+            def_indent = len(line) - len(line.lstrip(' \t'))
+            j = i + 1
+
+            while j < len(lines):
+                candidate = lines[j]
+                candidate_stripped = candidate.strip()
+                if not candidate_stripped:
+                    j += 1
+                    continue
+
+                candidate_indent = len(candidate) - len(candidate.lstrip(' \t'))
+                if candidate_indent <= def_indent and not candidate_stripped.startswith('#'):
+                    break
+                j += 1
+
+            end_line = j if j > i + 1 else i + 1
+            body_text = '\n'.join(lines[i:end_line])
+
+            functions.append({
+                'name_only': func_name,
+                'name_with_params': f"{func_name}({params})",
+                'body': body_text,
+                'start_line': start_line,
+                'end_line': end_line,
+            })
+
+            i = j
+
+        return {
+            'success': True,
+            'filepath': filepath,
+            'headers': sorted(set(imports)),
+            'globals': globals_vars,
+            'functions': functions,
+            'classes': classes,
+            'structs': structs,
+            'lines': len(lines),
+            'size': len(source_code),
+            'parser_mode': 'python_legacy_fallback',
+            'warning': f'AST parse failed; used legacy fallback parser: {parse_error}',
+        }
     
     def select_functions_for_mutation(
         self,
