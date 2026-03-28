@@ -5,8 +5,9 @@ Integrates with CAPE/Cuckoo sandbox for dynamic behavioral analysis
 of mutated executables.
 
 Supported backends:
-  - CAPE Sandbox (recommended, Cuckoo v3 fork)
-  - Cuckoo Sandbox v2 (legacy)
+    - CAPE Sandbox (recommended, Cuckoo v3 fork)
+    - Cuckoo Sandbox v2 (legacy)
+    - VirusTotal (cloud detonation/analysis)
 
 Features:
   - Submit compiled PE executables for analysis
@@ -50,7 +51,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SandboxReport:
     """Parsed sandbox analysis report"""
-    task_id: int = 0
+    task_id: Any = 0
     status: str = 'pending'          # pending | running | completed | failed | timeout
     score: float = 0.0               # threat score (0-10)
     
@@ -66,6 +67,11 @@ class SandboxReport:
     network_operations: List[Dict[str, Any]] = field(default_factory=list)
     process_operations: List[Dict[str, Any]] = field(default_factory=list)
     mutex_operations: List[str] = field(default_factory=list)
+    behavior_summary: Dict[str, Any] = field(default_factory=dict)
+    dll_loaded: List[str] = field(default_factory=list)
+
+    # MITRE ATT&CK TTPs
+    ttps: List[Dict[str, Any]] = field(default_factory=list)
     
     # File info
     sample_sha256: str = ''
@@ -95,6 +101,11 @@ class SandboxReport:
             'network_ops_count': len(self.network_operations),
             'process_ops_count': len(self.process_operations),
             'mutex_count': len(self.mutex_operations),
+            'behavior_summary': self.behavior_summary,
+            'dll_loaded': self.dll_loaded,
+            'dll_loaded_count': len(self.dll_loaded),
+            'ttps': self.ttps,
+            'ttp_count': len(self.ttps),
             'sample_sha256': self.sample_sha256,
             'sample_name': self.sample_name,
             'sample_size': self.sample_size,
@@ -210,7 +221,21 @@ class CapeApiClient:
                 if machine:
                     data['machine'] = machine
                 if options:
-                    data['options'] = ','.join(f'{k}={v}' for k, v in options.items())
+                    # CAPE supports some submission fields as top-level keys (e.g. route).
+                    # Keep backward-compatible "options" string for everything else.
+                    top_level_option_keys = {
+                        'route', 'package', 'custom', 'clock', 'memory',
+                        'enforce_timeout', 'priority', 'tags'
+                    }
+                    options_for_string = {}
+                    for k, v in options.items():
+                        if k in top_level_option_keys:
+                            data[k] = v
+                        else:
+                            options_for_string[k] = v
+
+                    if options_for_string:
+                        data['options'] = ','.join(f'{k}={v}' for k, v in options_for_string.items())
                 
                 r = self.session.post(
                     self._url('/apiv2/tasks/create/file/'),
@@ -263,13 +288,22 @@ class CapeApiClient:
     def get_report(self, task_id: int) -> Optional[Dict]:
         """Get full analysis report"""
         try:
-            r = self.session.get(
-                self._url(f'/apiv2/tasks/report/{task_id}/'),
-                timeout=60  # reports can be large
-            )
-            if r.status_code == 200:
-                return r.json()
-            logger.error(f"Report fetch failed ({r.status_code})")
+            # CAPEv2 current API uses /apiv2/tasks/get/report/{id}/(json)
+            # Keep backward compatibility with older /apiv2/tasks/report/{id}/ endpoint.
+            candidate_paths = [
+                f'/apiv2/tasks/get/report/{task_id}/json/',
+                f'/apiv2/tasks/get/report/{task_id}/',
+                f'/apiv2/tasks/report/{task_id}/',
+            ]
+
+            last_status = None
+            for path in candidate_paths:
+                r = self.session.get(self._url(path), timeout=60)  # reports can be large
+                last_status = r.status_code
+                if r.status_code == 200:
+                    return r.json()
+
+            logger.error(f"Report fetch failed ({last_status})")
             return None
         except Exception as e:
             logger.error(f"Report fetch error: {e}")
@@ -331,6 +365,20 @@ class CuckooV2ApiClient:
                 data = {'timeout': timeout_analysis, 'platform': platform}
                 if machine:
                     data['machine'] = machine
+                if options:
+                    top_level_option_keys = {
+                        'route', 'package', 'custom', 'clock', 'memory',
+                        'enforce_timeout', 'priority', 'tags'
+                    }
+                    options_for_string = {}
+                    for k, v in options.items():
+                        if k in top_level_option_keys:
+                            data[k] = v
+                        else:
+                            options_for_string[k] = v
+
+                    if options_for_string:
+                        data['options'] = ','.join(f'{k}={v}' for k, v in options_for_string.items())
                 r = self.session.post(
                     self._url('/tasks/create/file'),
                     files=files,
@@ -378,6 +426,130 @@ class CuckooV2ApiClient:
             return False
 
 
+class VirusTotalApiClient:
+    """
+    VirusTotal API v3 client.
+
+    Endpoints:
+        POST /api/v3/files              - submit file
+        GET  /api/v3/analyses/{id}      - check analysis status
+        GET  /api/v3/files/{sha256}     - get file report
+    """
+
+    def __init__(self, api_url: str = 'https://www.virustotal.com', api_token: str = '', timeout: int = 30):
+        self.api_url = api_url.rstrip('/')
+        self.api_token = api_token
+        self.timeout = timeout
+        self.session = requests.Session()
+        if api_token:
+            self.session.headers['x-apikey'] = api_token
+
+    def _url(self, path: str) -> str:
+        return f'{self.api_url}{path}'
+
+    def test_connection(self) -> bool:
+        """Test whether API key and VT endpoint are reachable."""
+        if not self.api_token:
+            return False
+        # Use known EICAR hash; 404/200 means endpoint+auth are reachable, 401 means bad key.
+        known_hash = '275a021bbfb6480f8a5abf1f7c1524f6d8f3f13f11f6f8f3bc5f3f9137bac9df'
+        try:
+            r = self.session.get(
+                self._url(f'/api/v3/files/{known_hash}'),
+                timeout=self.timeout
+            )
+            return r.status_code in (200, 404)
+        except Exception as e:
+            logger.warning(f"VT connection test failed: {e}")
+            return False
+
+    def submit_file(self, filepath: str,
+                    machine: str = '',
+                    platform: str = 'windows',
+                    timeout_analysis: int = 120,
+                    options: Dict[str, str] = None) -> Optional[str]:
+        del machine, platform, timeout_analysis, options  # not used by VT API
+        if not os.path.exists(filepath):
+            logger.error(f"File not found: {filepath}")
+            return None
+        if not self.api_token:
+            logger.error("VirusTotal API key missing")
+            return None
+        try:
+            with open(filepath, 'rb') as f:
+                files = {'file': (os.path.basename(filepath), f)}
+                r = self.session.post(
+                    self._url('/api/v3/files'),
+                    files=files,
+                    timeout=max(self.timeout, 120)
+                )
+            if r.status_code in (200, 201):
+                data = r.json().get('data', {})
+                return data.get('id')
+            logger.error(f"VT submit failed ({r.status_code}): {r.text[:500]}")
+            return None
+        except Exception as e:
+            logger.error(f"VT submit error: {e}")
+            return None
+
+    def get_task_status(self, task_id: str) -> str:
+        try:
+            r = self.session.get(
+                self._url(f'/api/v3/analyses/{task_id}'),
+                timeout=self.timeout
+            )
+            if r.status_code != 200:
+                return 'unknown'
+            status = r.json().get('data', {}).get('attributes', {}).get('status', 'unknown')
+            if status == 'completed':
+                return 'completed'
+            if status in ('queued', 'in-progress'):
+                return 'running'
+            return status
+        except Exception:
+            return 'unknown'
+
+    def get_report(self, task_id: str) -> Optional[Dict]:
+        """Return combined analysis + file report payload."""
+        try:
+            analysis_resp = self.session.get(
+                self._url(f'/api/v3/analyses/{task_id}'),
+                timeout=self.timeout
+            )
+            if analysis_resp.status_code != 200:
+                logger.error(f"VT analysis fetch failed ({analysis_resp.status_code})")
+                return None
+            analysis_json = analysis_resp.json()
+
+            attrs = analysis_json.get('data', {}).get('attributes', {})
+            sha256 = (
+                attrs.get('sha256')
+                or analysis_json.get('meta', {}).get('file_info', {}).get('sha256')
+            )
+
+            file_json = None
+            if sha256:
+                file_resp = self.session.get(
+                    self._url(f'/api/v3/files/{sha256}'),
+                    timeout=self.timeout
+                )
+                if file_resp.status_code == 200:
+                    file_json = file_resp.json()
+
+            return {
+                'analysis': analysis_json,
+                'file': file_json,
+            }
+        except Exception as e:
+            logger.error(f"VT report fetch error: {e}")
+            return None
+
+    def delete_task(self, task_id: str) -> bool:
+        del task_id
+        # VT does not expose task deletion for submitted analyses.
+        return True
+
+
 # ─────────────────────────────────────────────────────────────────
 # Main analyzer
 # ─────────────────────────────────────────────────────────────────
@@ -390,7 +562,7 @@ class SandboxAnalyzer:
     and parses behavioral reports.
     """
     
-    SUPPORTED_BACKENDS = ('cape', 'cuckoo')
+    SUPPORTED_BACKENDS = ('cape', 'cuckoo', 'virustotal')
     TERMINAL_STATES = {'completed', 'reported', 'failed_analysis', 'failed_processing'}
     
     def __init__(self, 
@@ -402,10 +574,11 @@ class SandboxAnalyzer:
                  analysis_timeout: int = 120,
                  poll_interval: int = 15,
                  max_wait: int = 600,
-                 cleanup: bool = False):
+                 cleanup: bool = False,
+                 submission_options: Optional[Dict[str, Any]] = None):
         """
         Args:
-            backend:           'cape' or 'cuckoo'
+            backend:           'cape' or 'cuckoo' or 'virustotal'
             api_url:           Base URL of the sandbox REST API
             api_token:         API authentication token (optional for local installs)
             machine:           Specific VM to use (empty = auto select)
@@ -425,14 +598,23 @@ class SandboxAnalyzer:
         self.poll_interval = poll_interval
         self.max_wait = max_wait
         self.cleanup = cleanup
+        self.submission_options = {
+            str(k): str(v)
+            for k, v in (submission_options or {}).items()
+            if k is not None and v is not None and str(k).strip() and str(v).strip()
+        }
         
         # Initialize API client
         if backend == 'cape':
             self.client = CapeApiClient(api_url, api_token)
-        else:
+        elif backend == 'cuckoo':
             self.client = CuckooV2ApiClient(api_url, api_token)
+        else:
+            self.client = VirusTotalApiClient(api_url, api_token)
         
         logger.info(f"SandboxAnalyzer initialized: backend={backend}, url={api_url}")
+        if self.submission_options:
+            logger.info(f"Sandbox submission options: {self.submission_options}")
     
     def test_connection(self) -> bool:
         """Test connectivity to the sandbox server"""
@@ -442,6 +624,39 @@ class SandboxAnalyzer:
         else:
             logger.error(f"❌ Cannot connect to {self.backend} sandbox")
         return connected
+
+    def _has_meaningful_behavior(self, raw: Dict[str, Any]) -> bool:
+        """Check whether a CAPE report already contains usable behavioral data."""
+        if not isinstance(raw, dict):
+            return False
+
+        behavior = raw.get('behavior', {})
+        if not isinstance(behavior, dict):
+            return False
+
+        processes = behavior.get('processes', [])
+        if isinstance(processes, list):
+            for proc in processes:
+                if not isinstance(proc, dict):
+                    continue
+                calls = proc.get('calls', [])
+                if isinstance(calls, dict):
+                    calls = calls.get('calls', []) or []
+                if isinstance(calls, list) and len(calls) > 0:
+                    return True
+
+        summary = behavior.get('summary', {})
+        if isinstance(summary, dict):
+            for k in ('files', 'read_files', 'write_files', 'delete_files',
+                      'keys', 'read_keys', 'write_keys', 'delete_keys',
+                      'mutexes', 'regkey_written', 'regkey_read', 'regkey_deleted',
+                      'file_created', 'file_written', 'file_deleted', 'file_read',
+                      'dll_loaded', 'dlls_loaded', 'loaded_dll', 'loaded_dlls'):
+                v = summary.get(k, [])
+                if isinstance(v, list) and len(v) > 0:
+                    return True
+
+        return False
     
     def submit_and_wait(self, filepath: str, timeout: int = None) -> SandboxReport:
         """
@@ -465,7 +680,8 @@ class SandboxAnalyzer:
             filepath,
             machine=self.machine,
             platform=self.platform,
-            timeout_analysis=self.analysis_timeout
+            timeout_analysis=self.analysis_timeout,
+            options=self.submission_options
         )
         
         if task_id is None:
@@ -497,10 +713,35 @@ class SandboxAnalyzer:
                     report.status = 'failed'
                     report.error_message = f'Sandbox analysis failed: {status}'
                     logger.error(report.error_message)
-                else:
+                    break
+                elif status == 'completed' and self.backend == 'virustotal':
+                    # VT analyses use 'completed' as final state and do not expose
+                    # CAPE-style behavior/report generation states.
                     report.status = 'completed'
                     logger.info(f"   ✅ Analysis completed in {int(elapsed)}s")
-                break
+                    break
+                elif status == 'reported':
+                    # Report is fully generated and ready to fetch
+                    report.status = 'completed'
+                    logger.info(f"   ✅ Analysis completed and reported in {int(elapsed)}s")
+                    break
+                elif status == 'completed':
+                    # VM analysis done - try fetching report (may or may not be ready yet)
+                    logger.info(f"   ⏳ VM analysis done, trying to fetch report early...")
+                    raw = self.client.get_report(task_id)
+                    if raw and self._has_meaningful_behavior(raw):
+                        report.status = 'completed'
+                        report.raw_report = raw
+                        self._parse_report(report, raw)
+                        report.complete_time = datetime.now().isoformat()
+                        report.analysis_duration = time.time() - start_time
+                        logger.info(f"   ✅ Report fetched at 'completed' stage in {int(elapsed)}s")
+                        if self.cleanup and task_id:
+                            self.client.delete_task(task_id)
+                        return report
+                    elif raw:
+                        logger.info("   ⏳ Early report exists but behavior is incomplete; waiting for 'reported'...")
+                    # Report not ready yet, keep polling until 'reported' or timeout
             
             time.sleep(self.poll_interval)
         
@@ -527,14 +768,46 @@ class SandboxAnalyzer:
         try:
             if self.backend == 'cape':
                 self._parse_cape_report(report, raw)
-            else:
+            elif self.backend == 'cuckoo':
                 self._parse_cuckoo_report(report, raw)
+            else:
+                self._parse_virustotal_report(report, raw)
         except Exception as e:
             logger.warning(f"Report parsing error: {e}")
             report.error_message = f'Report parse error: {e}'
     
     def _parse_cape_report(self, report: SandboxReport, raw: Dict):
         """Parse CAPE-specific report format"""
+        def _normalize_string_list(values):
+            normalized = []
+            for item in values or []:
+                if isinstance(item, str):
+                    val = item.strip()
+                    if val:
+                        normalized.append(val)
+                elif isinstance(item, dict):
+                    # Keep common module descriptors if present
+                    val = (
+                        item.get('filepath')
+                        or item.get('path')
+                        or item.get('name')
+                        or item.get('module')
+                        or item.get('dll')
+                        or ''
+                    )
+                    if isinstance(val, str):
+                        val = val.strip()
+                        if val:
+                            normalized.append(val)
+            # De-duplicate while preserving order
+            seen = set()
+            unique = []
+            for val in normalized:
+                if val not in seen:
+                    unique.append(val)
+                    seen.add(val)
+            return unique
+
         # Info section
         info = raw.get('info', {})
         report.score = info.get('score', 0)
@@ -564,50 +837,66 @@ class SandboxAnalyzer:
         
         # API calls
         for proc in behavior.get('processes', []):
-            for call in proc.get('calls', []):
+            calls = proc.get('calls', [])
+            if isinstance(calls, dict):
+                calls = calls.get('calls', []) or []
+            if not isinstance(calls, list):
+                calls = []
+
+            for call in calls:
                 report.api_calls.append({
                     'api': call.get('api', ''),
                     'category': call.get('category', ''),
                     'status': call.get('status', ''),
                     'return': call.get('return', ''),
                 })
-            report.api_call_count += len(proc.get('calls', []))
+            report.api_call_count += len(calls)
         
         # Summary (aggregated behavioral data)
         summary = behavior.get('summary', {})
+        if not isinstance(summary, dict):
+            summary = {}
+        report.behavior_summary = dict(summary)
         
         # Registry
-        for key in summary.get('regkey_written', []):
+        for key in summary.get('regkey_written', []) + summary.get('write_keys', []):
             report.registry_operations.append({'type': 'write', 'key': key})
-        for key in summary.get('regkey_read', []):
+        for key in summary.get('regkey_read', []) + summary.get('read_keys', []):
             report.registry_operations.append({'type': 'read', 'key': key})
-        for key in summary.get('regkey_deleted', []):
+        for key in summary.get('regkey_deleted', []) + summary.get('delete_keys', []):
             report.registry_operations.append({'type': 'delete', 'key': key})
         
         # Files
-        for f in summary.get('file_created', []):
+        for f in summary.get('file_created', []) + summary.get('files', []):
             report.file_operations.append({'type': 'create', 'path': f})
-        for f in summary.get('file_written', []):
+        for f in summary.get('file_written', []) + summary.get('write_files', []):
             report.file_operations.append({'type': 'write', 'path': f})
-        for f in summary.get('file_deleted', []):
+        for f in summary.get('file_deleted', []) + summary.get('delete_files', []):
             report.file_operations.append({'type': 'delete', 'path': f})
-        for f in summary.get('file_read', []):
+        for f in summary.get('file_read', []) + summary.get('read_files', []):
             report.file_operations.append({'type': 'read', 'path': f})
         
         # Network
-        for host in raw.get('network', {}).get('hosts', []):
+        network = raw.get('network', {}) if isinstance(raw.get('network', {}), dict) else {}
+        for host in network.get('hosts', []):
             report.network_operations.append({
                 'type': 'dns' if 'hostname' in host else 'ip',
                 'target': host.get('hostname', host.get('ip', '')),
                 'port': host.get('port', 0),
             })
-        for dns in raw.get('network', {}).get('dns', []):
+        for dns in network.get('dns', []):
             report.network_operations.append({
                 'type': 'dns',
                 'target': dns.get('request', ''),
                 'answers': dns.get('answers', []),
             })
-        for http in raw.get('network', {}).get('http', []):
+        for domain in network.get('domains', []):
+            report.network_operations.append({
+                'type': 'dns',
+                'target': domain.get('domain', ''),
+                'ip': domain.get('ip', ''),
+            })
+        for http in network.get('http', []):
             report.network_operations.append({
                 'type': 'http',
                 'method': http.get('method', ''),
@@ -618,15 +907,63 @@ class SandboxAnalyzer:
         # Processes
         for proc in behavior.get('processes', []):
             report.process_operations.append({
-                'pid': proc.get('pid', 0),
+                'pid': proc.get('pid', proc.get('process_id', 0)),
                 'process_name': proc.get('process_name', ''),
                 'command_line': proc.get('command_line', ''),
                 'parent_id': proc.get('parent_id', 0),
             })
         
         # Mutexes
-        report.mutex_operations = summary.get('mutex', [])
-    
+        report.mutex_operations = summary.get('mutex', []) + summary.get('mutexes', [])
+
+        # Loaded DLLs/modules from summary and process details
+        dll_candidates = []
+        for key in ('dll_loaded', 'dlls_loaded', 'loaded_dll', 'loaded_dlls', 'modules'):
+            values = summary.get(key, [])
+            if isinstance(values, list):
+                dll_candidates.extend(values)
+
+        for proc in behavior.get('processes', []):
+            if not isinstance(proc, dict):
+                continue
+            for key in ('dll_loaded', 'dlls_loaded', 'loaded_modules', 'modules'):
+                values = proc.get(key, [])
+                if isinstance(values, list):
+                    dll_candidates.extend(values)
+
+        report.dll_loaded = _normalize_string_list(dll_candidates)
+
+        # TTPs (MITRE ATT&CK)
+        # CAPE stores ATT&CK data in raw['ttps'] or raw['mitre']['attck']
+        for ttp in raw.get('ttps', []):
+            report.ttps.append({
+                'ttp': ttp.get('ttp', ttp.get('id', '')),
+                'name': ttp.get('name', ''),
+                'description': ttp.get('description', ''),
+                'tactic': ttp.get('tactic', ''),
+                'signature': ttp.get('signature', ''),
+            })
+        # Fallback: extract from signatures that have ATT&CK references
+        if not report.ttps:
+            for sig in raw.get('signatures', []):
+                for ref in sig.get('ttp', sig.get('ttps', sig.get('attack', []))):
+                    if isinstance(ref, dict):
+                        report.ttps.append({
+                            'ttp': ref.get('ttp', ref.get('id', '')),
+                            'name': ref.get('name', ''),
+                            'description': ref.get('description', ''),
+                            'tactic': ref.get('tactic', ''),
+                            'signature': sig.get('name', ''),
+                        })
+                    elif isinstance(ref, str) and ref:
+                        report.ttps.append({
+                            'ttp': ref,
+                            'name': '',
+                            'description': '',
+                            'tactic': '',
+                            'signature': sig.get('name', ''),
+                        })
+
     def _parse_cuckoo_report(self, report: SandboxReport, raw: Dict):
         """Parse Cuckoo v2 report format (very similar to CAPE)"""
         info = raw.get('info', {})
@@ -641,6 +978,9 @@ class SandboxAnalyzer:
         
         behavior = raw.get('behavior', {})
         summary = behavior.get('summary', {})
+        if not isinstance(summary, dict):
+            summary = {}
+        report.behavior_summary = dict(summary)
         
         # API calls
         for proc in behavior.get('processes', []):
@@ -672,6 +1012,90 @@ class SandboxAnalyzer:
         
         # Mutexes
         report.mutex_operations = summary.get('mutex', [])
+
+        # Loaded DLLs/modules
+        dll_candidates = []
+        for key in ('dll_loaded', 'dlls_loaded', 'loaded_dll', 'loaded_dlls', 'modules'):
+            values = summary.get(key, [])
+            if isinstance(values, list):
+                dll_candidates.extend(values)
+        for proc in behavior.get('processes', []):
+            if not isinstance(proc, dict):
+                continue
+            for key in ('dll_loaded', 'dlls_loaded', 'loaded_modules', 'modules'):
+                values = proc.get(key, [])
+                if isinstance(values, list):
+                    dll_candidates.extend(values)
+
+        seen = set()
+        report.dll_loaded = []
+        for item in dll_candidates:
+            if isinstance(item, str):
+                value = item.strip()
+            elif isinstance(item, dict):
+                value = (
+                    item.get('filepath')
+                    or item.get('path')
+                    or item.get('name')
+                    or item.get('module')
+                    or item.get('dll')
+                    or ''
+                )
+                value = value.strip() if isinstance(value, str) else ''
+            else:
+                value = ''
+            if value and value not in seen:
+                report.dll_loaded.append(value)
+                seen.add(value)
+
+    def _parse_virustotal_report(self, report: SandboxReport, raw: Dict):
+        """Parse VirusTotal API v3 analysis + file report format."""
+        analysis = raw.get('analysis', {}) if isinstance(raw, dict) else {}
+        file_rep = raw.get('file', {}) if isinstance(raw, dict) else {}
+
+        analysis_attrs = analysis.get('data', {}).get('attributes', {})
+        file_attrs = file_rep.get('data', {}).get('attributes', {}) if file_rep else {}
+
+        stats = analysis_attrs.get('stats', {}) or file_attrs.get('last_analysis_stats', {})
+        malicious = int(stats.get('malicious', 0) or 0)
+        suspicious = int(stats.get('suspicious', 0) or 0)
+        harmless = int(stats.get('harmless', 0) or 0)
+        undetected = int(stats.get('undetected', 0) or 0)
+        total_votes = max(malicious + suspicious + harmless + undetected, 1)
+
+        # Map VT verdicts to a CAPE-like score (0-10)
+        weighted = malicious + (0.5 * suspicious)
+        report.score = round(min(10.0, (weighted / total_votes) * 10.0), 2)
+
+        # Detections from engine results
+        report.detections = []
+        results = file_attrs.get('last_analysis_results', {})
+        if isinstance(results, dict):
+            for engine, result_obj in results.items():
+                category = str(result_obj.get('category', '')).lower()
+                if category in ('malicious', 'suspicious'):
+                    verdict = result_obj.get('result') or category
+                    report.detections.append(f"{engine}:{verdict}")
+
+        # High-level signatures/tags where available
+        for tag in file_attrs.get('tags', []) or []:
+            report.signatures.append({
+                'name': str(tag),
+                'description': 'VirusTotal tag',
+                'severity': 1,
+                'categories': ['vt_tag'],
+            })
+
+        # File info
+        report.sample_sha256 = (
+            file_rep.get('data', {}).get('id', '')
+            or analysis_attrs.get('sha256', '')
+            or report.sample_sha256
+        )
+        report.sample_size = int(file_attrs.get('size', report.sample_size or 0) or 0)
+
+        # VT does not expose detailed process/API traces in standard public responses;
+        # leave behavioral operation lists empty.
     
     def compare_reports(self, 
                         original: SandboxReport, 
@@ -778,7 +1202,8 @@ class SandboxAnalyzer:
             
             task_id = self.client.submit_file(
                 path, machine=self.machine, platform=self.platform,
-                timeout_analysis=self.analysis_timeout
+                timeout_analysis=self.analysis_timeout,
+                options=self.submission_options
             )
             if task_id:
                 report.task_id = task_id
@@ -837,9 +1262,9 @@ def main():
     """CLI for standalone sandbox analysis"""
     import argparse
     
-    parser = argparse.ArgumentParser(description='Submit executables to CAPE/Cuckoo sandbox')
+    parser = argparse.ArgumentParser(description='Submit executables to CAPE/Cuckoo/VirusTotal sandbox')
     parser.add_argument('files', nargs='+', help='PE executable(s) to analyze')
-    parser.add_argument('--backend', choices=['cape', 'cuckoo'], default='cape')
+    parser.add_argument('--backend', choices=['cape', 'cuckoo', 'virustotal'], default='cape')
     parser.add_argument('--url', default='http://localhost:8090', help='Sandbox API URL')
     parser.add_argument('--token', default='', help='API token')
     parser.add_argument('--timeout', type=int, default=300, help='Max wait time (seconds)')

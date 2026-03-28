@@ -28,6 +28,28 @@ from datetime import datetime
 from collections import Counter
 import traceback
 
+
+def _load_dotenv_file(env_path: str) -> None:
+    """Lightweight .env loader (no external dependency)."""
+    if not os.path.exists(env_path):
+        return
+
+    try:
+        with open(env_path, 'r', encoding='utf-8') as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+
+                key, value = line.split('=', 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+
+                if key and value and not os.environ.get(key):
+                    os.environ[key] = value
+    except Exception as e:
+        print(f"WARNING: Failed to load .env file: {e}")
+
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
@@ -173,6 +195,10 @@ class ProjectBasedMutationPipeline:
         
     def load_config(self, config_path):
         """Load configuration from JSON file"""
+        # Load local .env first so keys are available to all stages
+        repo_root = os.path.dirname(os.path.abspath(__file__))
+        _load_dotenv_file(os.path.join(repo_root, '.env'))
+
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"Config file not found: {config_path}")
         
@@ -2446,9 +2472,300 @@ class ProjectBasedMutationPipeline:
             mahoraga_memory_file=None,
             external_fixer=None,
         )
+
+    def _normalize_project_key(self, name: str) -> str:
+        """Normalize project/config keys for resilient matching."""
+        if not name:
+            return ''
+        return ''.join(ch.lower() for ch in name if ch.isalnum())
+
+    def _resolve_original_executable_path(self, project_name: str, sandbox_cfg: dict) -> str:
+        """Resolve original executable path from config and common fallback locations."""
+        mapping = sandbox_cfg.get('original_executables', {}) or {}
+        candidates = []
+
+        # 1) Exact key match
+        configured = mapping.get(project_name, '')
+        if configured:
+            candidates.append(configured)
+
+        # 2) Normalized key match (case/punctuation-insensitive)
+        if not configured and mapping:
+            target_key = self._normalize_project_key(project_name)
+            for cfg_key, cfg_path in mapping.items():
+                if self._normalize_project_key(cfg_key) == target_key and cfg_path:
+                    candidates.append(cfg_path)
+                    break
+
+        # 3) compilation_result.json in original_executables/<project>
+        original_root = os.path.join(
+            self.config.get('environment', {}).get('project_root', ''),
+            'original_executables',
+            project_name,
+        )
+        comp_result_path = os.path.join(original_root, 'compilation_result.json')
+        if os.path.exists(comp_result_path):
+            try:
+                with open(comp_result_path, 'r', encoding='utf-8') as f:
+                    comp_result = json.load(f)
+                exe_from_result = comp_result.get('executable_path', '')
+                if exe_from_result:
+                    candidates.append(exe_from_result)
+            except Exception as e:
+                self.logger.debug(f"Could not read {comp_result_path}: {e}")
+
+        # 4) Any .exe under original_executables/<project>
+        if os.path.isdir(original_root):
+            for root, _, files in os.walk(original_root):
+                for fname in files:
+                    if fname.lower().endswith('.exe'):
+                        candidates.append(os.path.join(root, fname))
+
+        # Return first existing candidate
+        for candidate in candidates:
+            if candidate and os.path.exists(candidate):
+                return candidate
+
+        return ''
+
+    def _find_detected_project(self, project_name: str):
+        """Find detected MalwareProject by name (robust matching)."""
+        target_key = self._normalize_project_key(project_name)
+        for project in self.detected_projects:
+            if self._normalize_project_key(project.name) == target_key:
+                return project
+        return None
+
+    def _build_original_executable(self, project_name: str, output_path: str) -> str:
+        """Build original executable on-the-fly if missing from disk."""
+        project = self._find_detected_project(project_name)
+        if not project:
+            self.logger.warning(f"   ⚠️  Cannot auto-build original: project '{project_name}' not found in detected projects.")
+            return ''
+
+        comp_config = self.config.get('compilation', {})
+
+        # Ensure compiler is initialized
+        if self.compiler is None:
+            compiler_pref = comp_config.get('compiler', 'auto')
+            msvc_arch = comp_config.get('msvc_arch', 'x64')
+            self.compiler = ProjectCompiler(compiler=compiler_pref, msvc_arch=msvc_arch)
+
+        output_dir = os.path.dirname(output_path)
+        output_name = os.path.basename(output_path)
+        os.makedirs(output_dir, exist_ok=True)
+
+        parse_result = self.parse_results.get(project_name, {}).get('parse_result')
+
+        self.logger.info(f"   🔧 Building original executable (fallback): {output_path}")
+        result = self.compiler.compile_project(
+            project,
+            output_dir=output_dir,
+            output_name=output_name,
+            auto_fix=comp_config.get('auto_fix', True),
+            max_fix_attempts=comp_config.get('max_fix_attempts', 5),
+            llm_model=comp_config.get('llm_model', 'deepseek-chat'),
+            use_llm_fixer=comp_config.get('use_llm_fixer', True),
+            llm_fixer_max_code_length=comp_config.get('llm_fixer_max_code_length', 50000),
+            permissive_mode=comp_config.get('permissive_mode', True),
+            parse_result=parse_result,
+            pre_validate=comp_config.get('pre_validate', False),
+            auto_generate_headers=comp_config.get('auto_generate_headers', True),
+            use_enhanced_categorization=comp_config.get('use_enhanced_categorization', True),
+            use_project_context=comp_config.get('use_project_context', True),
+            use_hybrid_llm=comp_config.get('use_hybrid_llm', False),
+            hybrid_local_model=comp_config.get('hybrid_local_model', 'qwen2.5-coder:7b-instruct-q4_K_M'),
+            hybrid_cloud_file_size_limit=comp_config.get('hybrid_cloud_file_size_limit', 120000),
+            hybrid_mode=comp_config.get('hybrid_mode', 'hybrid'),
+            use_mahoraga=False,
+            mahoraga_memory_file=None,
+            external_fixer=None,
+        )
+
+        if result.success:
+            # Prefer compiler-reported path when it exists
+            if result.executable_path and os.path.exists(result.executable_path):
+                self.logger.info(f"   ✅ Original build success: {result.executable_path}")
+                return result.executable_path
+
+            # Fallback to requested output path
+            if output_path and os.path.exists(output_path):
+                self.logger.info(f"   ✅ Original build success: {output_path}")
+                return output_path
+
+            # Last resort: find any .exe produced in output directory
+            output_dir = os.path.dirname(output_path)
+            exe_candidates = []
+            if os.path.isdir(output_dir):
+                for fname in os.listdir(output_dir):
+                    if fname.lower().endswith('.exe'):
+                        full_path = os.path.join(output_dir, fname)
+                        if os.path.isfile(full_path):
+                            exe_candidates.append(full_path)
+
+            if exe_candidates:
+                exe_candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                recovered = exe_candidates[0]
+                self.logger.warning(
+                    f"   ⚠️  Expected original executable missing at '{output_path}', "
+                    f"using recovered executable: {recovered}"
+                )
+                return recovered
+
+            self.logger.warning(
+                f"   ⚠️  Original build reported success but executable is missing on disk for {project_name}. "
+                f"This may be caused by external quarantine/removal."
+            )
+            return ''
+
+        self.logger.warning(f"   ⚠️  Original build failed for {project_name}")
+        return ''
+
+    def _resolve_sandbox_backends(self, sandbox_cfg: dict):
+        """Resolve requested sandbox backends with backward compatibility."""
+        backends = []
+
+        configured_backends = sandbox_cfg.get('backends', None)
+        if isinstance(configured_backends, list):
+            backends.extend(str(b).strip().lower() for b in configured_backends if str(b).strip())
+
+        if not backends:
+            backend = str(sandbox_cfg.get('backend', 'cape')).strip().lower()
+            if backend in ('combined', 'cape+virustotal', 'virustotal+cape'):
+                backends.extend(['cape', 'virustotal'])
+            elif ',' in backend:
+                backends.extend([b.strip().lower() for b in backend.split(',') if b.strip()])
+            else:
+                backends.append(backend)
+
+        # Keep order while de-duplicating and filtering unsupported values
+        supported = {'cape', 'cuckoo', 'virustotal'}
+        seen = set()
+        resolved = []
+        for b in backends:
+            if b in supported and b not in seen:
+                resolved.append(b)
+                seen.add(b)
+
+        return resolved or ['cape']
+
+    def _get_backend_runtime_config(self, backend: str, sandbox_cfg: dict) -> dict:
+        """Get effective per-backend runtime config with sensible defaults."""
+        backend_settings = sandbox_cfg.get('backend_settings', {}) or {}
+        bcfg = backend_settings.get(backend, {}) or {}
+
+        if backend == 'virustotal':
+            default_url = 'https://www.virustotal.com'
+        else:
+            default_url = 'http://localhost:8090'
+
+        # Backward compatibility keys + backend-specific overrides
+        api_url = (
+            bcfg.get('api_url')
+            or sandbox_cfg.get(f'{backend}_api_url')
+            or sandbox_cfg.get('api_url')
+            or default_url
+        )
+
+        api_token = (
+            bcfg.get('api_token')
+            or sandbox_cfg.get(f'{backend}_api_token')
+            or sandbox_cfg.get('api_token', '')
+        )
+
+        token_env = bcfg.get('api_token_env') or sandbox_cfg.get(f'{backend}_api_token_env')
+        if token_env and not api_token:
+            api_token = os.environ.get(token_env, '')
+
+        if backend == 'virustotal' and not api_token:
+            api_token = os.environ.get('VIRUSTOTAL_API_KEY', '')
+
+        return {
+            'backend': backend,
+            'api_url': api_url,
+            'api_token': api_token,
+            'machine': bcfg.get('machine', sandbox_cfg.get('machine', '')),
+            'analysis_timeout': bcfg.get('analysis_timeout', sandbox_cfg.get('analysis_timeout', 120)),
+            'poll_interval': bcfg.get('poll_interval', sandbox_cfg.get('poll_interval', 15)),
+            'max_wait': bcfg.get('max_wait', sandbox_cfg.get('max_wait', 600)),
+            'cleanup': bcfg.get('cleanup', sandbox_cfg.get('cleanup', False)),
+            'submission_options': bcfg.get('submission_options', sandbox_cfg.get('submission_options', {})) or {},
+        }
+
+    def _build_backend_failure_report(self, sample_path: str, status: str, error_message: str):
+        """Create a synthetic sandbox report for backend initialization/connection failures."""
+        return SandboxReport(
+            status=status,
+            error_message=error_message,
+            sample_name=os.path.basename(sample_path) if sample_path else '',
+            sample_size=os.path.getsize(sample_path) if sample_path and os.path.exists(sample_path) else 0,
+        )
+
+    def _build_combined_sandbox_summary(self, project_sandbox: dict) -> dict:
+        """Aggregate CAPE/Cuckoo/VirusTotal backend results into a combined summary."""
+        backend_results = project_sandbox.get('backends', {}) or {}
+        completed_backends = []
+        failed_backends = {}
+        mutated_detection_counts = {}
+        original_detection_counts = {}
+        mutated_scores = {}
+        original_scores = {}
+        mutated_ttp_counts = {}
+        original_ttp_counts = {}
+        comparison_by_backend = {}
+
+        for backend, backend_result in backend_results.items():
+            mutated = backend_result.get('mutated', {}) or {}
+            original = backend_result.get('original', {}) or {}
+            comparison = backend_result.get('comparison', {}) or {}
+
+            mutated_status = mutated.get('status', 'unknown')
+            if mutated_status == 'completed':
+                completed_backends.append(backend)
+            else:
+                failed_backends[backend] = {
+                    'status': mutated_status,
+                    'error_message': mutated.get('error_message', ''),
+                }
+
+            mutated_detection_counts[backend] = len(mutated.get('detections', []) or [])
+            original_detection_counts[backend] = len(original.get('detections', []) or [])
+            mutated_scores[backend] = mutated.get('score', 0)
+            original_scores[backend] = original.get('score', 0)
+            mutated_ttp_counts[backend] = len(mutated.get('ttps', []) or [])
+            original_ttp_counts[backend] = len(original.get('ttps', []) or [])
+
+            if comparison:
+                comparison_by_backend[backend] = comparison
+
+        best_backend = None
+        if comparison_by_backend:
+            best_backend = min(
+                comparison_by_backend,
+                key=lambda name: (
+                    comparison_by_backend[name].get('detection_delta', float('inf')),
+                    comparison_by_backend[name].get('score_delta', float('inf')),
+                )
+            )
+
+        return {
+            'requested_backends': project_sandbox.get('requested_backends', []),
+            'available_backends': sorted(list(project_sandbox.get('available_backends', []))),
+            'completed_backends': completed_backends,
+            'failed_backends': failed_backends,
+            'status': 'completed' if completed_backends else 'failed',
+            'mutated_detection_counts': mutated_detection_counts,
+            'original_detection_counts': original_detection_counts,
+            'mutated_scores': mutated_scores,
+            'original_scores': original_scores,
+            'mutated_ttp_counts': mutated_ttp_counts,
+            'original_ttp_counts': original_ttp_counts,
+            'comparison_by_backend': comparison_by_backend,
+            'best_backend_for_evasion': best_backend,
+        }
     
     def stage6_sandbox_analysis(self, project_names=None):
-        """Stage 6: Submit compiled executables to CAPE/Cuckoo sandbox for behavioral analysis"""
+        """Stage 6: Submit compiled executables to CAPE/Cuckoo/VirusTotal for behavioral analysis"""
         self.logger.info("\n" + "="*70)
         self.logger.info("STAGE 6: SANDBOX BEHAVIORAL ANALYSIS")
         self.logger.info("="*70)
@@ -2461,43 +2778,74 @@ class ProjectBasedMutationPipeline:
         if not sandbox_cfg.get('enabled', False):
             self.logger.info("   Sandbox analysis disabled in config.")
             return
-        
-        backend = sandbox_cfg.get('backend', 'cape')
-        api_url = sandbox_cfg.get('api_url', 'http://localhost:8090')
-        api_token = sandbox_cfg.get('api_token', '')
-        machine = sandbox_cfg.get('machine', '')
-        analysis_timeout = sandbox_cfg.get('analysis_timeout', 120)
-        poll_interval = sandbox_cfg.get('poll_interval', 15)
-        max_wait = sandbox_cfg.get('max_wait', 600)
-        cleanup = sandbox_cfg.get('cleanup', False)
+
+        backends = self._resolve_sandbox_backends(sandbox_cfg)
         submit_original = sandbox_cfg.get('submit_original', True)
-        
-        self.logger.info(f"   Backend: {backend}")
-        self.logger.info(f"   API URL: {api_url}")
-        self.logger.info(f"   Analysis timeout: {analysis_timeout}s")
-        self.logger.info(f"   Max wait: {max_wait}s")
-        
-        # Initialize analyzer
-        try:
-            analyzer = SandboxAnalyzer(
-                backend=backend,
-                api_url=api_url,
-                api_token=api_token,
-                machine=machine,
-                analysis_timeout=analysis_timeout,
-                poll_interval=poll_interval,
-                max_wait=max_wait,
-                cleanup=cleanup
+
+        self.logger.info(f"   Backends: {', '.join(backends)}")
+
+        analyzers = {}
+        backend_health = {}
+        for backend in backends:
+            cfg = self._get_backend_runtime_config(backend, sandbox_cfg)
+            self.logger.info(
+                f"   [{backend}] URL={cfg['api_url']}, timeout={cfg['analysis_timeout']}s, max_wait={cfg['max_wait']}s"
             )
-        except Exception as e:
-            self.logger.error(f"❌ Failed to initialize sandbox analyzer: {e}")
+
+            # VT requires API key; skip gracefully if missing
+            if backend == 'virustotal' and not cfg['api_token']:
+                message = "Missing API token. Set VIRUSTOTAL_API_KEY or sandbox.backend_settings.virustotal.api_token"
+                self.logger.warning(f"   ⚠️  [virustotal] {message}")
+                backend_health[backend] = {
+                    'available': False,
+                    'error_message': message,
+                    'api_url': cfg['api_url'],
+                }
+                continue
+
+            try:
+                analyzer = SandboxAnalyzer(
+                    backend=cfg['backend'],
+                    api_url=cfg['api_url'],
+                    api_token=cfg['api_token'],
+                    machine=cfg['machine'],
+                    analysis_timeout=cfg['analysis_timeout'],
+                    poll_interval=cfg['poll_interval'],
+                    max_wait=cfg['max_wait'],
+                    cleanup=cfg['cleanup'],
+                    submission_options=cfg.get('submission_options', {})
+                )
+            except Exception as e:
+                self.logger.error(f"❌ Failed to initialize {backend} analyzer: {e}")
+                backend_health[backend] = {
+                    'available': False,
+                    'error_message': f'Failed to initialize analyzer: {e}',
+                    'api_url': cfg['api_url'],
+                }
+                continue
+
+            if not analyzer.test_connection():
+                self.logger.error(f"❌ Cannot connect to {backend} at {cfg['api_url']}")
+                backend_health[backend] = {
+                    'available': False,
+                    'error_message': f"Cannot connect to {backend} at {cfg['api_url']}",
+                    'api_url': cfg['api_url'],
+                }
+                continue
+
+            analyzers[backend] = analyzer
+            backend_health[backend] = {
+                'available': True,
+                'error_message': '',
+                'api_url': cfg['api_url'],
+            }
+
+        if not analyzers:
+            self.logger.error("❌ No sandbox backend available. Stage 6 skipped.")
             return
-        
-        # Test connection
-        if not analyzer.test_connection():
-            self.logger.error(f"❌ Cannot connect to {backend} sandbox at {api_url}")
-            self.logger.error(f"   Make sure the sandbox server is running.")
-            return
+
+        primary_backend = next(iter(analyzers.keys()))
+        self.logger.info(f"   Primary backend for top-level summary: {primary_backend}")
         
         # Create sandbox output directory
         sandbox_output = os.path.join(self.run_folder, 'sandbox_reports')
@@ -2526,57 +2874,160 @@ class ProjectBasedMutationPipeline:
             self.logger.info(f"{'='*60}")
             self.logger.info(f"   Executable: {exe_path}")
             
-            project_sandbox = {}
-            
-            # Submit mutated executable
-            self.logger.info(f"\n   📤 Submitting mutated variant...")
-            mutated_report = analyzer.submit_and_wait(exe_path)
-            project_sandbox['mutated'] = mutated_report.to_dict()
-            
-            if mutated_report.status == 'completed':
-                self.logger.info(f"   ✅ Analysis complete!")
-                self.logger.info(f"      Score: {mutated_report.score}/10")
-                self.logger.info(f"      Detections: {len(mutated_report.detections)}")
-                self.logger.info(f"      API calls: {mutated_report.api_call_count}")
-                self.logger.info(f"      Signatures: {len(mutated_report.signatures)}")
-                self.logger.info(f"      Registry ops: {len(mutated_report.registry_operations)}")
-                self.logger.info(f"      Network ops: {len(mutated_report.network_operations)}")
-                
-                if mutated_report.signatures:
-                    self.logger.info(f"      Top signatures:")
-                    for sig in mutated_report.signatures[:5]:
-                        self.logger.info(f"         [{sig.get('severity',0)}] {sig['name']}")
-            else:
-                self.logger.error(f"   ❌ Analysis failed: {mutated_report.error_message}")
-            
-            # Optionally submit original for comparison
+            project_sandbox = {
+                'requested_backends': backends,
+                'available_backends': list(analyzers.keys()),
+                'primary_backend': primary_backend,
+                'backend_health': backend_health,
+                'backends': {},
+            }
+
+            # Resolve original executable once per project (shared by all backends)
+            original_exe = ''
             if submit_original:
-                # Find original executable (compiled from unmodified source)
-                original_exe = sandbox_cfg.get('original_executables', {}).get(project_name, '')
-                if original_exe and os.path.exists(original_exe):
-                    self.logger.info(f"\n   📤 Submitting original for comparison...")
-                    original_report = analyzer.submit_and_wait(original_exe)
-                    project_sandbox['original'] = original_report.to_dict()
-                    
+                original_exe = self._resolve_original_executable_path(project_name, sandbox_cfg)
+                if not original_exe:
+                    default_output = os.path.join(
+                        self.config.get('environment', {}).get('project_root', ''),
+                        'original_executables',
+                        project_name,
+                        f'{project_name}_original.bin.exe',
+                    )
+                    original_exe = self._build_original_executable(project_name, default_output)
+
+                if not (original_exe and os.path.exists(original_exe)):
+                    self.logger.info(f"   ℹ️  No usable original executable found for comparison.")
+                    self.logger.info(f"      Checked sandbox.original_executables.{project_name} and fallback paths.")
+                    self.logger.info(f"      Please ensure an original .exe exists or can be compiled for this project.")
+                    original_exe = ''
+
+            for backend, analyzer in analyzers.items():
+                self.logger.info(f"\n   ▶ Backend: {backend}")
+                backend_result = {}
+
+                # Submit mutated executable
+                self.logger.info(f"   📤 Submitting mutated variant...")
+                try:
+                    mutated_report = analyzer.submit_and_wait(exe_path)
+                except Exception as e:
+                    self.logger.exception(f"   ❌ [{backend}] Mutated submission crashed: {e}")
+                    mutated_report = SandboxReport(
+                        status='failed',
+                        error_message=f'Exception during mutated analysis: {e}',
+                        sample_name=os.path.basename(exe_path),
+                        sample_size=os.path.getsize(exe_path) if os.path.exists(exe_path) else 0,
+                    )
+                backend_result['mutated'] = mutated_report.to_dict()
+
+                if mutated_report.status == 'completed':
+                    self.logger.info(f"   ✅ [{backend}] Analysis complete")
+                    self.logger.info(f"      Score: {mutated_report.score}/10")
+                    self.logger.info(f"      Detections: {len(mutated_report.detections)}")
+                    self.logger.info(f"      API calls: {mutated_report.api_call_count}")
+                    self.logger.info(f"      Signatures: {len(mutated_report.signatures)}")
+                    self.logger.info(f"      Registry ops: {len(mutated_report.registry_operations)}")
+                    self.logger.info(f"      Network ops: {len(mutated_report.network_operations)}")
+                else:
+                    self.logger.error(f"   ❌ [{backend}] Analysis failed: {mutated_report.error_message}")
+
+                if submit_original and original_exe:
+                    # File may disappear after initial resolution/build (e.g. quarantine/removal).
+                    # Re-validate right before submission and try one recovery pass.
+                    if not os.path.exists(original_exe):
+                        self.logger.warning(
+                            f"   ⚠️  Original executable no longer exists before submission: {original_exe}"
+                        )
+
+                        recovered_original = self._resolve_original_executable_path(project_name, sandbox_cfg)
+                        if not recovered_original:
+                            default_output = os.path.join(
+                                self.config.get('environment', {}).get('project_root', ''),
+                                'original_executables',
+                                project_name,
+                                f'{project_name}_original.bin.exe',
+                            )
+                            recovered_original = self._build_original_executable(project_name, default_output)
+
+                        if recovered_original and os.path.exists(recovered_original):
+                            original_exe = recovered_original
+                            self.logger.info(f"   ✅ Recovered original executable: {original_exe}")
+                        else:
+                            self.logger.warning(
+                                "   ⚠️  Skipping original comparison for this backend: no usable original executable."
+                            )
+                            backend_result['original'] = self._build_backend_failure_report(
+                                original_exe,
+                                'skipped',
+                                'Original executable missing on disk before submission'
+                            ).to_dict()
+                            project_sandbox['backends'][backend] = backend_result
+                            continue
+
+                    self.logger.info(f"   📤 Submitting original for comparison...")
+                    self.logger.info(f"      Original executable: {original_exe}")
+                    try:
+                        original_report = analyzer.submit_and_wait(original_exe)
+                    except Exception as e:
+                        self.logger.exception(f"   ❌ [{backend}] Original submission crashed: {e}")
+                        original_report = SandboxReport(
+                            status='failed',
+                            error_message=f'Exception during original analysis: {e}',
+                            sample_name=os.path.basename(original_exe),
+                            sample_size=os.path.getsize(original_exe) if os.path.exists(original_exe) else 0,
+                        )
+                    backend_result['original'] = original_report.to_dict()
+
                     if original_report.status == 'completed' and mutated_report.status == 'completed':
                         comparison = analyzer.compare_reports(original_report, mutated_report)
-                        project_sandbox['comparison'] = comparison.to_dict()
-                        
-                        self.logger.info(f"\n   📊 BEHAVIORAL COMPARISON:")
+                        backend_result['comparison'] = comparison.to_dict()
+
+                        self.logger.info(f"   📊 [{backend}] BEHAVIORAL COMPARISON:")
                         self.logger.info(f"      Original score:  {original_report.score}")
                         self.logger.info(f"      Mutated score:   {mutated_report.score} (delta: {comparison.score_delta:+.1f})")
                         self.logger.info(f"      Detection delta: {comparison.detection_delta:+d}")
                         self.logger.info(f"      API similarity:  {comparison.api_similarity:.1%}")
                         self.logger.info(f"      Behavior preserved: {comparison.behavioral_preserved}")
-                        
+
                         if comparison.removed_signatures:
                             self.logger.info(f"      ✅ Signatures evaded: {', '.join(comparison.removed_signatures)}")
                         if comparison.new_signatures:
                             self.logger.info(f"      ⚠️  New signatures:   {', '.join(comparison.new_signatures)}")
-                else:
-                    if submit_original:
-                        self.logger.info(f"   ℹ️  No original executable configured for comparison.")
-                        self.logger.info(f"      Set sandbox.original_executables.{project_name} in config to enable comparison.")
+
+                project_sandbox['backends'][backend] = backend_result
+
+            for backend in backends:
+                if backend in project_sandbox['backends']:
+                    continue
+
+                backend_error = (project_sandbox.get('backend_health', {}).get(backend, {}) or {}).get('error_message', '')
+                project_sandbox['backends'][backend] = {
+                    'mutated': self._build_backend_failure_report(
+                        exe_path,
+                        'unavailable',
+                        backend_error or f'{backend} backend unavailable'
+                    ).to_dict()
+                }
+                if submit_original and original_exe:
+                    project_sandbox['backends'][backend]['original'] = self._build_backend_failure_report(
+                        original_exe,
+                        'unavailable',
+                        backend_error or f'{backend} backend unavailable'
+                    ).to_dict()
+
+            project_sandbox['combined_summary'] = self._build_combined_sandbox_summary(project_sandbox)
+            combined = project_sandbox['combined_summary']
+            self.logger.info(
+                "   🧩 Combined summary: status=%s, completed_backends=%s",
+                combined.get('status', 'unknown'),
+                ', '.join(combined.get('completed_backends', [])) or 'none'
+            )
+
+            # Backward compatibility: keep top-level keys from primary backend
+            primary_result = project_sandbox['backends'].get(primary_backend, {})
+            if primary_result:
+                for key in ('mutated', 'original', 'comparison'):
+                    if key in primary_result:
+                        project_sandbox[key] = primary_result[key]
             
             # Save per-project report
             report_file = os.path.join(sandbox_output, f'{project_name}_sandbox_report.json')
@@ -2591,8 +3042,10 @@ class ProjectBasedMutationPipeline:
         self.logger.info(f"SANDBOX ANALYSIS SUMMARY")
         self.logger.info(f"{'='*60}")
         total = len(projects_to_analyze)
-        completed = sum(1 for r in self.sandbox_results.values() 
-                       if r.get('mutated', {}).get('status') == 'completed')
+        completed = sum(
+            1 for r in self.sandbox_results.values()
+            if (r.get('combined_summary', {}) or {}).get('status') == 'completed'
+        )
         self.logger.info(f"   Analyzed: {completed}/{total}")
         
         for pname, result in self.sandbox_results.items():
@@ -2602,6 +3055,22 @@ class ProjectBasedMutationPipeline:
             detections = mut.get('detections', [])
             self.logger.info(f"   {'✅' if status == 'completed' else '❌'} {pname}: "
                            f"score={score}, detections={len(detections)}")
+
+            for backend, backend_result in result.get('backends', {}).items():
+                bmut = backend_result.get('mutated', {})
+                bstatus = bmut.get('status', 'unknown')
+                bscore = bmut.get('score', 0)
+                bdetections = bmut.get('detections', [])
+                self.logger.info(
+                    f"      - [{backend}] {'✅' if bstatus == 'completed' else '❌'} "
+                    f"score={bscore}, detections={len(bdetections)}"
+                )
+            combined = result.get('combined_summary', {}) or {}
+            if combined:
+                self.logger.info(
+                    f"      - [combined] {'✅' if combined.get('status') == 'completed' else '❌'} "
+                    f"completed_backends={','.join(combined.get('completed_backends', [])) or 'none'}"
+                )
     
     def generate_final_report(self):
         """Generate final report"""

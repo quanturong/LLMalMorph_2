@@ -9,7 +9,7 @@ config.json
 secrets.json
 *secret*
 *password*
-
+original_executables/
 # Logs
 *.log
 logs/
