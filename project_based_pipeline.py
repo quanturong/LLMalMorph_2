@@ -23,6 +23,7 @@ import argparse
 import shutil
 import random
 import time
+import subprocess
 from pathlib import Path
 from datetime import datetime
 from collections import Counter
@@ -367,6 +368,7 @@ class ProjectBasedMutationPipeline:
         self.logger.info("="*70)
         
         mutation_config = self.config['mutation']
+        supported_compile_languages = {'c', 'cpp', 'python'}
         
         # Legacy feature: seed tracking
         initial_seed = mutation_config.get('initial_seed', 42)
@@ -398,6 +400,9 @@ class ProjectBasedMutationPipeline:
                 k: v for k, v in self.parse_results.items()
                 if k in project_names
             }
+
+        supported_mutation_languages = {'c', 'cpp', 'python'}
+        skipped_unsupported = 0
         
         for project_name, project_data in projects_to_mutate.items():
             self.logger.info(f"\n{'='*60}")
@@ -408,6 +413,15 @@ class ProjectBasedMutationPipeline:
             
             project = project_data['project']
             parse_result = project_data['parse_result']
+            project_language = project.get_language()
+
+            if project_language not in supported_mutation_languages:
+                skipped_unsupported += 1
+                self.logger.warning(
+                    f"⚠️  Skipping mutation for {project_name}: unsupported language '{project_language}'. "
+                    f"Supported: {sorted(supported_mutation_languages)}"
+                )
+                continue
             
             # Collect project context if enhanced tools available
             project_context = None
@@ -595,9 +609,9 @@ class ProjectBasedMutationPipeline:
                                             func, variant_func
                                         )
                                 
-                                # Restore local variable names (prevents macro breakage)
+                                # Restore local variable names (C/C++ only; prevents macro breakage)
                                 orig_body = func.get('body', '')
-                                if orig_body:
+                                if orig_body and project_language in {'c', 'cpp'}:
                                     for variant_func in mutated.get('variant_functions', []):
                                         if 'body' in variant_func:
                                             variant_func['body'] = self._restore_local_variable_names(
@@ -705,7 +719,16 @@ class ProjectBasedMutationPipeline:
                 self.logger.info(f"   Best trial: {best_trial + 1}/{experiment_trial_no}")
             self.logger.info(f"   Exported to: {mutation_output_file}")
         
-        return len(self.mutation_results) > 0
+        if self.mutation_results:
+            return True
+
+        if skipped_unsupported > 0 and len(projects_to_mutate) == skipped_unsupported:
+            self.logger.info(
+                "ℹ️  No mutation executed because all selected projects are non-C/C++."
+            )
+            return True
+
+        return False
     
     def _clean_llm_artifacts(self, code: str) -> str:
         """
@@ -1335,6 +1358,43 @@ class ProjectBasedMutationPipeline:
         - batch_num: Current batch number for batch processing
         """
         try:
+            def _normalize_language(src_file: str) -> str:
+                ext = os.path.splitext(src_file)[1].lower().lstrip('.')
+                if ext == 'py':
+                    return 'python'
+                if ext in {'cpp', 'cxx', 'cc'}:
+                    return 'cpp'
+                if ext == 'c':
+                    return 'c'
+                return ext or 'c'
+
+            def _parse_python_response(response_text: str):
+                import re as _re
+
+                code_blocks = _re.findall(r'```(.*?)```', response_text, _re.DOTALL)
+                cleaned_blocks = []
+                for block in code_blocks:
+                    block = _re.sub(r'^[a-zA-Z+#]*\n', '\n', block, count=1)
+                    cleaned_blocks.append(block)
+
+                code = ''.join(cleaned_blocks).strip() if cleaned_blocks else response_text.strip()
+                if not code:
+                    return None, 0, None
+
+                parser = ProjectParser()
+                parsed = parser._parse_python_file('temp_mutation.py', code)
+                if not parsed.get('success'):
+                    return None, 0, None
+
+                segmented = (
+                    parsed.get('headers', []),
+                    parsed.get('globals', []),
+                    parsed.get('functions', []),
+                    parsed.get('classes', []),
+                    parsed.get('structs', []),
+                )
+                return segmented, len(code.splitlines()), None
+
             def _is_stub_body(body: str) -> bool:
                 """Heuristic to reject placeholder/stub bodies returned by LLM."""
                 if not body:
@@ -1386,24 +1446,36 @@ class ProjectBasedMutationPipeline:
             from utility_prompt_library import strategy_prompt_dict
             strategy = mutation_config['strategy']
             strategy_prompt = strategy_prompt_dict.get(strategy, strategy_prompt_dict['strat_1'])
-            language = func.get('source_file', '').split('.')[-1]
+            language = _normalize_language(func.get('source_file', ''))
             num_functions = 1
             
             # Compose mutation prompt
-            mutation_prompt = (
-                f"Below is a {language} function named ***{func_name}***. "
-                f"Modify it following these instructions:\n"
-                f"{strategy_prompt}\n"
-                f"\nCOMPILATION RULES:\n"
-                f"1. Do NOT add, remove, or change any #include directives. Do NOT redefine Windows SDK types or macros.\n"
-                f"2. No inline assembly. Target MSVC x86, portable C/C++.\n"
-                f"3. Keep ALL original function calls and macro invocations with the same arguments and types.\n"
-                f"4. Keep the original return type, parameter types, and return statements.\n"
-                f"5. Do NOT rename, remove, or change the type of ANY variable declaration. Keep every variable name and type identical.\n"
-                f"6. Do NOT merge variables, shadow existing names, or use macro names (like APPEND_STRING) as variable names.\n"
-                f"7. Do NOT change narrow string functions (strcpy, strlen, strcmp, strcat, sprintf) to wide-string equivalents (wcscpy, wcslen, wcscmp, wcscat, wsprintf) or vice versa.\n"
-                f"8. Output ONLY the complete modified function. No explanations, no comments before/after.\n"
-            )
+            if language == 'python':
+                mutation_prompt = (
+                    f"Below is a Python function named ***{func_name}***. "
+                    f"Modify it following these instructions:\n"
+                    f"{strategy_prompt}\n"
+                    f"\nPYTHON RULES:\n"
+                    f"1. Keep function name and parameter list unchanged.\n"
+                    f"2. Preserve behavior and return semantics.\n"
+                    f"3. Keep valid Python indentation and syntax.\n"
+                    f"4. Output ONLY the complete modified function. No explanations.\n"
+                )
+            else:
+                mutation_prompt = (
+                    f"Below is a {language} function named ***{func_name}***. "
+                    f"Modify it following these instructions:\n"
+                    f"{strategy_prompt}\n"
+                    f"\nCOMPILATION RULES:\n"
+                    f"1. Do NOT add, remove, or change any #include directives. Do NOT redefine Windows SDK types or macros.\n"
+                    f"2. No inline assembly. Target MSVC x86, portable C/C++.\n"
+                    f"3. Keep ALL original function calls and macro invocations with the same arguments and types.\n"
+                    f"4. Keep the original return type, parameter types, and return statements.\n"
+                    f"5. Do NOT rename, remove, or change the type of ANY variable declaration. Keep every variable name and type identical.\n"
+                    f"6. Do NOT merge variables, shadow existing names, or use macro names (like APPEND_STRING) as variable names.\n"
+                    f"7. Do NOT change narrow string functions (strcpy, strlen, strcmp, strcat, sprintf) to wide-string equivalents (wcscpy, wcslen, wcscmp, wcscat, wsprintf) or vice versa.\n"
+                    f"8. Output ONLY the complete modified function. No explanations, no comments before/after.\n"
+                )
             
             # Add mutation safety constraints if available
             safety_prompt = ""
@@ -1429,14 +1501,17 @@ class ProjectBasedMutationPipeline:
             # Retrieve hybrid mode and llm_model from mutation_config
             use_hybrid = mutation_config.get('use_hybrid_llm', False)
             llm_model = mutation_config.get('llm_model', 'codestral-2508')
-            system_prompt = "You are an intelligent coding assistant who is expert in writing, editing, refactoring and debugging code. You listen to exact instructions and specialize in systems programming and use of C, C++ and C# languages with Windows platforms"
+            if language == 'python':
+                system_prompt = "You are an intelligent coding assistant specialized in Python refactoring and code mutation. Return only valid Python code."
+            else:
+                system_prompt = "You are an intelligent coding assistant who is expert in writing, editing, refactoring and debugging code. You listen to exact instructions and specialize in systems programming and use of C, C++ and C# languages with Windows platforms"
 
             # =====================================================
             # Legacy feature: STRATEGY CHAINING (strat_all)
             # When strategy is 'strat_all', chain multiple strategies
             # sequentially — output of one becomes input to next
             # =====================================================
-            if strategy == 'strat_all' and strat_all_order:
+            if strategy == 'strat_all' and strat_all_order and language != 'python':
                 llm_response = None
                 current_user_prompt = user_prompt
                 initial_seed_val = seed
@@ -1530,12 +1605,15 @@ class ProjectBasedMutationPipeline:
                         use_hybrid, llm_model, language, trial_no, seed, batch_num
                     )
                     
-                    # Try parsing immediately to check validity  
-                    segmented_code_check, _, _ = parse_code_any_format(
-                        llm_response,
-                        language=language,
-                        source_code_response_format=source_code_response_format,
-                    )
+                    # Try parsing immediately to check validity
+                    if language == 'python':
+                        segmented_code_check, _, _ = _parse_python_response(llm_response)
+                    else:
+                        segmented_code_check, _, _ = parse_code_any_format(
+                            llm_response,
+                            language=language,
+                            source_code_response_format=source_code_response_format,
+                        )
                     
                     if segmented_code_check is None:
                         self.logger.warning(f"      ⚠️  LLM response parse failed, retry {try_again + 1}/{retry_attempts}")
@@ -1556,14 +1634,17 @@ class ProjectBasedMutationPipeline:
             llm_response_time = getattr(self, '_last_llm_response_time', 0)
             
             # Parse response FIRST (needs backtick markers intact)
-            segmented_code, lines_of_code_generated, mapping = parse_code_any_format(
-                llm_response,
-                language=language,
-                source_code_response_format=source_code_response_format,
-            )
+            if language == 'python':
+                segmented_code, lines_of_code_generated, mapping = _parse_python_response(llm_response)
+            else:
+                segmented_code, lines_of_code_generated, mapping = parse_code_any_format(
+                    llm_response,
+                    language=language,
+                    source_code_response_format=source_code_response_format,
+                )
             
             # If parsing failed, try cleaning artifacts and parsing as raw code
-            if segmented_code is None:
+            if segmented_code is None and language != 'python':
                 cleaned_response = self._clean_llm_artifacts(llm_response)
                 if cleaned_response and cleaned_response.strip():
                     # Try parsing the cleaned code directly (without backtick extraction)
@@ -1590,14 +1671,20 @@ class ProjectBasedMutationPipeline:
             
             # Clean LLM artifacts from variant function bodies AFTER parsing
             for vf in variant_functions:
-                if 'body' in vf:
+                if 'body' in vf and language != 'python':
                     vf['body'] = self._clean_llm_artifacts(vf['body'])
 
             # Filter out stub/placeholder variants and any with inline asm/non-portable extensions
-            variant_functions = [
-                vf for vf in variant_functions
-                if not _is_stub_body(vf.get('body', '')) and not _contains_inline_asm(vf.get('body', ''))
-            ]
+            if language == 'python':
+                variant_functions = [
+                    vf for vf in variant_functions
+                    if vf.get('body', '').strip()
+                ]
+            else:
+                variant_functions = [
+                    vf for vf in variant_functions
+                    if not _is_stub_body(vf.get('body', '')) and not _contains_inline_asm(vf.get('body', ''))
+                ]
             
             if not variant_functions:
                 return None
@@ -1605,7 +1692,7 @@ class ProjectBasedMutationPipeline:
             # === POST-MUTATION VALIDATION ===
             # Sanitize variant functions to remove dangerous patterns that break compilation
             for vf in variant_functions:
-                if 'body' in vf:
+                if 'body' in vf and language != 'python':
                     vf['body'] = self._sanitize_mutation_output(vf['body'])
             
             # === COMPREHENSIVE MUTATION VALIDATION GATES ===
@@ -1673,7 +1760,7 @@ class ProjectBasedMutationPipeline:
                         rejected = True
                 
                 # Gate 4: BRACE BALANCE — check balanced braces
-                if not rejected:
+                if not rejected and language != 'python':
                     brace_depth = 0
                     for ch in body:
                         if ch == '{':
@@ -1691,7 +1778,7 @@ class ProjectBasedMutationPipeline:
                 
                 # Gate 5: VARIABLE DECLARATIONS — check that original variables are preserved
                 # The LLM often removes or renames variable declarations, breaking macros
-                if not rejected and orig_body:
+                if not rejected and orig_body and language != 'python':
                     import re as _re_var
                     def _extract_var_names(fn_body):
                         """Extract set of local variable names from a function body."""
@@ -1785,6 +1872,24 @@ class ProjectBasedMutationPipeline:
         """
         start_time = time.time()
         
+        def _run_cloud_model_direct(model_name: str):
+            from src.llm_api import ollama_chat_api
+            api_key = self._get_cloud_api_key()
+            return ollama_chat_api(
+                model_name=model_name,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                seed=seed,
+                api_key=api_key,
+            )
+
+        is_cloud_model = (
+            llm_model.startswith("deepseek-")
+            or llm_model.startswith("codestral-")
+            or llm_model.startswith("mistral-")
+            or llm_model == "codestral-latest"
+        )
+
         if use_hybrid:
             try:
                 hybrid_provider = self._get_hybrid_provider()
@@ -1798,15 +1903,21 @@ class ProjectBasedMutationPipeline:
                 self.logger.info(f"   🔀 Hybrid LLM used: {hybrid_provider.stats}")
             except Exception as e:
                 self.logger.warning(f"   ⚠️  Hybrid LLM failed, falling back to cloud: {e}")
+                if is_cloud_model:
+                    llm_response = _run_cloud_model_direct(llm_model)
+                else:
+                    llm = get_llm_name_from_input(llm_model)
+                    llm_response, _ = run_experiment_trial(
+                        llm, system_prompt, user_prompt, trial_no, "", language, "", 1, seed, batch_num, set()
+                    )
+        else:
+            if is_cloud_model:
+                llm_response = _run_cloud_model_direct(llm_model)
+            else:
                 llm = get_llm_name_from_input(llm_model)
                 llm_response, _ = run_experiment_trial(
                     llm, system_prompt, user_prompt, trial_no, "", language, "", 1, seed, batch_num, set()
                 )
-        else:
-            llm = get_llm_name_from_input(llm_model)
-            llm_response, _ = run_experiment_trial(
-                llm, system_prompt, user_prompt, trial_no, "", language, "", 1, seed, batch_num, set()
-            )
         
         self._last_llm_response_time = time.time() - start_time
         return llm_response
@@ -2126,6 +2237,142 @@ class ProjectBasedMutationPipeline:
             
         except Exception as e:
             self.logger.error(f"   ❌ Failed to generate variant: {e}")
+
+    def _compile_python_variant(self, project_name, variant_dir, output_dir, timeout_seconds=300):
+        """Compile a Python project variant into a single executable via PyInstaller."""
+        result = CompilationResult()
+        start_time = time.time()
+
+        try:
+            def _normalize_python2_syntax(code: str) -> str:
+                import re
+                # print x  -> print(x)
+                def _replace_print(match):
+                    indent = match.group(1)
+                    expr = match.group(2).strip()
+                    if expr.startswith('('):
+                        return match.group(0)
+                    return f"{indent}print({expr})"
+
+                code = re.sub(r'(?m)^(\s*)print\s+([^\n]+)$', _replace_print, code)
+                # except E, e: -> except E as e:
+                code = re.sub(
+                    r'(?m)^(\s*)except\s+([^:\n,]+)\s*,\s*([A-Za-z_]\w*)\s*:',
+                    r'\1except \2 as \3:',
+                    code,
+                )
+                code = code.replace('xrange(', 'range(')
+                code = code.replace('raw_input(', 'input(')
+                return code
+
+            py_files = []
+            for root, _, files in os.walk(variant_dir):
+                for filename in files:
+                    if filename.lower().endswith('.py'):
+                        py_files.append(os.path.join(root, filename))
+
+            if not py_files:
+                result.errors = f"No Python source files found in {variant_dir}"
+                return result
+
+            # Convert legacy Python 2 syntax so Python 3 based packagers can compile.
+            for py_file in py_files:
+                try:
+                    with open(py_file, 'r', encoding='utf-8', errors='ignore') as f:
+                        original = f.read()
+                    normalized = _normalize_python2_syntax(original)
+                    if normalized != original:
+                        with open(py_file, 'w', encoding='utf-8') as f:
+                            f.write(normalized)
+                except Exception:
+                    continue
+
+            # Entry-point heuristic: prefer common runner names, then __main__ guard, then first file.
+            preferred_names = [
+                f"{project_name}.py",
+                "main.py",
+                "__main__.py",
+                "run.py",
+                "compileZIB.py",
+            ]
+
+            entry_file = None
+            by_name = {os.path.basename(p): p for p in py_files}
+            for name in preferred_names:
+                if name in by_name:
+                    entry_file = by_name[name]
+                    break
+
+            if entry_file is None:
+                for candidate in sorted(py_files):
+                    try:
+                        with open(candidate, 'r', encoding='utf-8', errors='ignore') as f:
+                            content = f.read()
+                        if '__name__' in content and '__main__' in content:
+                            entry_file = candidate
+                            break
+                    except Exception:
+                        continue
+
+            if entry_file is None:
+                entry_file = sorted(py_files)[0]
+
+            exe_name = f"{project_name}_mutated"
+            work_dir = os.path.join(output_dir, "pyinstaller_work")
+            spec_dir = os.path.join(output_dir, "pyinstaller_spec")
+            os.makedirs(work_dir, exist_ok=True)
+            os.makedirs(spec_dir, exist_ok=True)
+
+            command = [
+                sys.executable,
+                "-m",
+                "PyInstaller",
+                "--noconfirm",
+                "--clean",
+                "--onefile",
+                "--distpath",
+                output_dir,
+                "--workpath",
+                work_dir,
+                "--specpath",
+                spec_dir,
+                "--name",
+                exe_name,
+                entry_file,
+            ]
+
+            proc = subprocess.run(
+                command,
+                cwd=variant_dir,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
+
+            result.output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+
+            if proc.returncode != 0:
+                result.errors = result.output
+                return result
+
+            executable_path = os.path.join(output_dir, f"{exe_name}.exe")
+            if not os.path.exists(executable_path):
+                result.errors = f"PyInstaller succeeded but executable not found: {executable_path}"
+                return result
+
+            result.success = True
+            result.executable_path = executable_path
+            result.executable_size = os.path.getsize(executable_path)
+            return result
+
+        except subprocess.TimeoutExpired:
+            result.errors = f"Python compilation timed out after {timeout_seconds} seconds"
+            return result
+        except Exception as e:
+            result.errors = str(e)
+            return result
+        finally:
+            result.compile_time = time.time() - start_time
     
     def stage5_compile_variants(self, project_names=None):
         """Stage 5: Compile project variants"""
@@ -2153,11 +2400,51 @@ class ProjectBasedMutationPipeline:
             self.logger.info("🔑 DEEPSEEK_API_KEY set from config")
         
         mutation_config = self.config['mutation']
+        supported_compile_languages = {'c', 'cpp', 'python'}
         
         for project_name, mutation_data in projects_to_compile.items():
+            project = mutation_data.get('project')
+            project_language = project.get_language() if project else 'unknown'
+            if project_language not in supported_compile_languages:
+                self.logger.info(
+                    f"ℹ️  Skipping compilation for {project_name}: unsupported language '{project_language}'."
+                )
+                continue
+
             variant_dir = mutation_data.get('variant_dir')
             if not variant_dir:
                 self.logger.warning(f"⚠️  No variant directory for {project_name}")
+                continue
+
+            if project_language == 'python':
+                self.logger.info(f"\n{'='*60}")
+                self.logger.info(f"Compiling Python variant: {project_name}")
+                self.logger.info(f"{'='*60}")
+
+                output_dir = os.path.join(
+                    self.run_folder,
+                    'executables',
+                    project_name
+                )
+                os.makedirs(output_dir, exist_ok=True)
+
+                compile_timeout = comp_config.get('compile_timeout', 300)
+                result = self._compile_python_variant(
+                    project_name=project_name,
+                    variant_dir=variant_dir,
+                    output_dir=output_dir,
+                    timeout_seconds=compile_timeout,
+                )
+
+                self.compilation_results[project_name] = result
+
+                if result.success:
+                    self.logger.info(f"\n🎉 PYTHON COMPILATION SUCCESS!")
+                    self.logger.info(f"   Executable: {result.executable_path}")
+                else:
+                    self.logger.error(f"\n❌ PYTHON COMPILATION FAILED!")
+                    if result.errors:
+                        self.logger.error(f"   Error: {result.errors[:1200]}")
                 continue
             
             self.logger.info(f"\n{'='*60}")

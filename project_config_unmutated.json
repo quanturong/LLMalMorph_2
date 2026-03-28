@@ -1,13 +1,13 @@
 {
   "environment": {
-    "project_root": "E:\\LLMalMorph2",
-    "output_dir": "E:\\LLMalMorph2\\project_mutation_output",
+    "project_root": "E:\\MW\\LLMalMorph_2",
+    "output_dir": "E:\\MW\\LLMalMorph_2\\project_mutation_output",
     "api_key_env": "DEEPSEEK_API_KEY",
     "api_key": "",
     "deepseek_api_key": ""
   },
-    "project_detection": {
-      "base_directory": "E:\\LLMalMorph2\\samples\\experiment_samples\\extracted\\samples\\experiment_samples\\trojan_posgrabber\\Trojan-Banker.Win32.Dexter_EXPERIMENT\\Dexter",
+  "project_detection": {
+    "base_directory": "E:\\MW\\LLMalMorph_2\\samples\\ZIB-Trojan",
     "min_files_for_project": 1,
     "recursive_search": true,
     "filters": {
@@ -17,9 +17,9 @@
     }
   },
   "mutation": {
-    "num_functions_per_project": 10,
+    "num_functions_per_project": 0,
     "function_selection_strategy": "largest",
-      "strategy": "strat_all",
+    "strategy": "strat_all",
     "llm_model": "deepseek-chat",
     "trials": 1,
     "initial_seed": 42,
@@ -27,7 +27,11 @@
     "func_batch_size": 1,
     "source_code_response_format": "backticks",
     "retry_generation_attempts": 5,
-    "strat_all_order": ["strat_1", "strat_5", "strat_6"],
+    "strat_all_order": [
+      "strat_1",
+      "strat_5",
+      "strat_6"
+    ],
     "batch_mutations": false,
     "preserve_signatures": true,
     "preserve_entry_points": true,
@@ -84,47 +88,16 @@
   },
   "sandbox": {
     "enabled": true,
-    "backend": "combined",
-    "backends": ["cape", "virustotal"],
-    "api_url": "http://192.168.1.12:8000",
+    "backend": "cape",
+    "api_url": "http://localhost:8090",
     "api_token": "",
-    "machine": "win10",
-    "analysis_timeout": 300,
+    "machine": "",
+    "analysis_timeout": 120,
     "poll_interval": 15,
-    "max_wait": 900,
+    "max_wait": 600,
     "cleanup": false,
     "submit_original": true,
-    "backend_settings": {
-      "cape": {
-        "api_url": "http://192.168.1.12:8000",
-        "api_token": "",
-        "machine": "win10",
-        "analysis_timeout": 300,
-        "poll_interval": 15,
-        "max_wait": 900,
-        "cleanup": false,
-        "submission_options": {
-          "route": "inetsim",
-          "enforce_timeout": "1"
-        }
-      },
-      "virustotal": {
-        "api_url": "https://www.virustotal.com",
-        "api_token": "",
-        "api_token_env": "VIRUSTOTAL_API_KEY",
-        "analysis_timeout": 120,
-        "poll_interval": 20,
-        "max_wait": 900,
-        "cleanup": false
-      }
-    },
-    "original_executables": {
-      "POSGrabber": "E:\\LLMalMorph2\\original_executables\\POSGrabber\\POSGrabber_original.bin.exe",
-      "Win32.RansomWar": "E:\\LLMalMorph2\\original_executables\\Win32.RansomWar\\Win32_RansomWar_original.bin.exe",
-      "Win32.Fungus": "E:\\LLMalMorph2\\project_mutation_output\\run_20260303_023454\\executables\\Win32.Fungus\\Win32.Fungus_mutated.exe",
-      "ShadowBot v3 - March 2007": "E:\\LLMalMorph2\\project_mutation_output\\run_20260303_023454\\executables\\ShadowBot v3 - March 2007\\ShadowBot v3 - March 2007_mutated.exe",
-      "RedPetyaOpenSSL": "E:\\LLMalMorph2\\project_mutation_output\\run_20260303_023454\\executables\\RedPetyaOpenSSL\\RedPetyaOpenSSL_mutated.exe"
-    }
+    "original_executables": {}
   },
   "_comments": {
     "function_selection_strategy": "Options: 'largest', 'random', 'all'",
@@ -159,9 +132,9 @@
     "preserve_critical_functions": "Don't mutate functions with critical prefixes or export markers",
     "filter_unsafe_candidates": "Filter out cross-file referenced and exported functions from mutation",
     "sandbox_enabled": "STAGE 6: Enable sandbox behavioral analysis after compilation",
-    "sandbox_backend": "Options: 'cape' (CAPE Sandbox), 'cuckoo' (Cuckoo v2), or 'virustotal' (VT API v3)",
-    "sandbox_api_url": "Sandbox API URL (e.g., http://192.168.1.100:8090 for CAPE/Cuckoo, https://www.virustotal.com for VT)",
-    "sandbox_api_token": "API authentication token (Token for CAPE, Bearer for Cuckoo, x-apikey for VirusTotal)",
+    "sandbox_backend": "Options: 'cape' (CAPE Sandbox) or 'cuckoo' (Cuckoo v2)",
+    "sandbox_api_url": "REST API URL of your sandbox server (e.g., http://192.168.1.100:8090)",
+    "sandbox_api_token": "API authentication token (optional for local CAPE installs)",
     "sandbox_machine": "Specific VM name to use (empty = auto-select)",
     "sandbox_analysis_timeout": "Max analysis time inside sandbox VM in seconds (default: 120)",
     "sandbox_max_wait": "Max total wait time for results in seconds (default: 600)",
